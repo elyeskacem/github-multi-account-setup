@@ -5,6 +5,20 @@ one machine: SSH host aliases, per-repo identity, owner-scoped URL rewriting,
 and commit/push guard hooks. Pure Python stdlib (tkinter for the GUI is
 optional) — works on Windows, macOS, and Linux.
 
+## Requirements
+
+Python 3.8+, standard library only — no `pip install` needed, no
+`requirements.txt`. The GUI wizard additionally needs `tkinter`, which ships
+with the standard installer on Windows and macOS; on Linux it's a separate
+OS package if missing:
+
+```
+sudo apt install python3-tk       # Debian/Ubuntu
+sudo dnf install python3-tkinter  # Fedora
+```
+
+`--cli` mode needs no GUI dependency at all.
+
 ## Run it
 
 ```
@@ -12,10 +26,6 @@ python setup_git_accounts.py            # GUI wizard
 python setup_git_accounts.py --cli      # terminal wizard (no tkinter needed)
 python setup_git_accounts.py --cli --dry-run   # preview only, writes nothing
 ```
-
-On Linux, if tkinter isn't installed (`ModuleNotFoundError`), either install
-it (`sudo apt install python3-tk` / `sudo dnf install python3-tkinter`) or
-just use `--cli`.
 
 You'll be asked, once, for:
 - the one folder that should **always** use the personal account (e.g.

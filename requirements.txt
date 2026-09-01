@@ -1,8 +1,0 @@
-# No external dependencies -- this project uses only the Python standard
-# library (argparse, dataclasses, pathlib, subprocess, tkinter for the GUI).
-#
-# tkinter ships with the standard CPython installer on Windows and macOS.
-# On Linux it's a separate OS package if missing:
-#   Debian/Ubuntu: sudo apt install python3-tk
-#   Fedora:        sudo dnf install python3-tkinter
-# The --cli mode needs no GUI dependency at all.
