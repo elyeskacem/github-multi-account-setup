@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+
+# Backups this tool writes into $HOME, never into the repo itself, but keep
+# the pattern here in case one is ever copied in by mistake
+.git-identity-backup-*/
