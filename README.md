@@ -62,6 +62,14 @@ You'll be asked, once, for:
 - git aliases: `git whoami`, `git use-personal`, `git use-work`,
   `git clone-personal`, `git clone-work`.
 
+## Remembering your last answers
+
+On a successful apply, your answers (folder, names, emails, owners, key
+paths — never key contents) are cached to `~/.git-account-setup-cache.json`.
+Next time you open the wizard, every field is prefilled from that cache, so
+you can see your last configuration and just tweak or re-confirm it instead
+of retyping everything (`--dry-run` doesn't update the cache).
+
 ## Safety
 
 - Every file the script would modify is backed up first, to

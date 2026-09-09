@@ -29,6 +29,11 @@ Every write is preceded by a timestamped backup of the files it touches,
 and re-running the script is idempotent (it replaces its own previously
 written block instead of duplicating it).
 
+On a successful (non-dry-run) apply, the answers you gave -- folder, names,
+emails, owners, key paths; never key contents -- are cached to
+~/.git-account-setup-cache.json and used to prefill the wizard next time you
+open it, so you can see/tweak your last configuration instead of retyping it.
+
 Usage:
     python setup_git_accounts.py            # GUI wizard (tkinter)
     python setup_git_accounts.py --cli      # terminal wizard, no tkinter needed
@@ -42,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import os
 import shutil
 import subprocess
@@ -52,6 +58,8 @@ from pathlib import Path
 
 BEGIN_MARK = "# >>> git-multi-account (managed by git_account_setup.py) >>>"
 END_MARK = "# <<< git-multi-account (managed by git_account_setup.py) <<<"
+
+CACHE_FILE = Path.home() / ".git-account-setup-cache.json"
 
 STUB_HOOK_NAMES = [
     "applypatch-msg", "pre-applypatch", "post-applypatch",
@@ -106,6 +114,44 @@ class SetupConfig:
 
 
 LogFn = "callable"
+
+
+# --------------------------------------------------------------------------
+# cache -- remembers the last answers you gave (never key contents) so the
+# wizard opens pre-filled with what you last set up
+# --------------------------------------------------------------------------
+
+def load_cache() -> dict:
+    if not CACHE_FILE.exists():
+        return {}
+    try:
+        return json.loads(CACHE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def account_to_cache(acct: Account) -> dict:
+    return {
+        "name": acct.name,
+        "email": acct.email,
+        "owners": acct.owners,
+        "key_path": str(acct.key_path),
+        "generate_key": acct.generate_key,
+    }
+
+
+def save_cache(cfg: SetupConfig) -> None:
+    data = {
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "personal_folder": str(cfg.personal_folder),
+        "hooks_dir": str(cfg.hooks_dir),
+        "personal": account_to_cache(cfg.personal),
+        "work": account_to_cache(cfg.work),
+    }
+    try:
+        CACHE_FILE.write_text(json.dumps(data, indent=2), newline="\n")
+    except OSError:
+        pass
 
 
 def run(cmd: list[str], log) -> None:
@@ -574,6 +620,10 @@ def apply_config(cfg: SetupConfig, dry_run: bool, log) -> None:
     log("== hooks ==")
     write_hooks(cfg, dry_run, log)
 
+    if not dry_run:
+        save_cache(cfg)
+        log(f"  remembered these settings in {CACHE_FILE} for next time")
+
     log("")
     log("Done." if not dry_run else "Dry run complete -- nothing was written.")
     log("")
@@ -593,9 +643,10 @@ def prompt(text: str, default: str = "") -> str:
     return val or default
 
 
-def prompt_required(text: str) -> str:
+def prompt_required(text: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
     while True:
-        val = input(f"{text}: ").strip()
+        val = input(f"{text}{suffix}: ").strip() or default
         if val:
             return val
         print("  this field is required.")
@@ -613,33 +664,53 @@ def cli_wizard() -> SetupConfig:
     print("Git multi-account setup -- terminal wizard\n")
 
     home = Path.home()
-    default_personal_folder = str(home / "Projects" / "Personal")
+    cache = load_cache()
+    if cache:
+        print(f"(prefilled from {CACHE_FILE}, saved {cache.get('saved_at', 'earlier')} "
+              "-- press Enter to keep a value, or type a new one)\n")
+    cp = cache.get("personal", {})
+    cw = cache.get("work", {})
+
+    default_personal_folder = cache.get("personal_folder", str(home / "Projects" / "Personal"))
     personal_folder = Path(prompt(
         "Folder that should ALWAYS use the personal account (everything else defaults to work)",
         default_personal_folder,
     ))
 
     print("\n-- Personal account --")
-    p_owner = prompt_required("  GitHub username")
-    p_name = prompt("  Git author name", p_owner)
-    p_email = prompt_required("  Git email")
-    p_extra_owners = prompt("  Any other GitHub owners/orgs for this account (comma-separated, optional)", "")
+    p_owners_cached = cp.get("owners", [])
+    p_owner = prompt_required("  GitHub username", p_owners_cached[0] if p_owners_cached else "")
+    p_name = prompt("  Git author name", cp.get("name", p_owner))
+    p_email = prompt_required("  Git email", cp.get("email", ""))
+    p_extra_owners = prompt(
+        "  Any other GitHub owners/orgs for this account (comma-separated, optional)",
+        ", ".join(p_owners_cached[1:]),
+    )
     p_owners = [p_owner] + [o.strip() for o in p_extra_owners.split(",") if o.strip()]
-    p_generate = prompt_yn("  Generate a new SSH key for this account?", True)
-    p_key = Path(prompt("  SSH private key path", str(home / ".ssh" / "id_ed25519_personal")))
+    p_generate = prompt_yn("  Generate a new SSH key for this account?", cp.get("generate_key", True))
+    p_key = Path(prompt("  SSH private key path", cp.get("key_path", str(home / ".ssh" / "id_ed25519_personal"))))
 
     print("\n-- Work account --")
-    w_owner = prompt_required("  GitHub username or org")
-    w_name = prompt("  Git author name", w_owner)
-    w_email = prompt_required("  Git email")
-    w_extra_owners = prompt("  Any other GitHub owners/orgs for this account (comma-separated, optional)", "")
+    w_owners_cached = cw.get("owners", [])
+    w_owner = prompt_required("  GitHub username or org", w_owners_cached[0] if w_owners_cached else "")
+    w_name = prompt("  Git author name", cw.get("name", w_owner))
+    w_email = prompt_required("  Git email", cw.get("email", ""))
+    w_extra_owners = prompt(
+        "  Any other GitHub owners/orgs for this account (comma-separated, optional)",
+        ", ".join(w_owners_cached[1:]),
+    )
     w_owners = [w_owner] + [o.strip() for o in w_extra_owners.split(",") if o.strip()]
-    w_generate = prompt_yn("  Generate a new SSH key for this account?", True)
-    w_key = Path(prompt("  SSH private key path", str(home / ".ssh" / "id_ed25519_work")))
+    w_generate = prompt_yn("  Generate a new SSH key for this account?", cw.get("generate_key", True))
+    w_key = Path(prompt("  SSH private key path", cw.get("key_path", str(home / ".ssh" / "id_ed25519_work"))))
 
     personal = Account("personal", p_name, p_email, p_owners, p_key, p_generate)
     work = Account("work", w_name, w_email, w_owners, w_key, w_generate)
-    return SetupConfig(personal=personal, work=work, personal_folder=personal_folder)
+    return SetupConfig(
+        personal=personal,
+        work=work,
+        personal_folder=personal_folder,
+        hooks_dir=Path(cache.get("hooks_dir", str(home / ".githooks"))),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -651,6 +722,10 @@ def gui_wizard() -> None:
     from tkinter import filedialog, messagebox, scrolledtext, ttk
 
     home = Path.home()
+    cache = load_cache()
+    cp = cache.get("personal", {})
+    cw = cache.get("work", {})
+
     root = tk.Tk()
     root.title("Git multi-account setup")
     root.geometry("640x720")
@@ -712,27 +787,42 @@ def gui_wizard() -> None:
     )
     intro.pack(fill="x", padx=10, pady=(10, 0))
 
+    if cache:
+        ttk.Label(
+            body, foreground="#2a6", wraplength=580, justify="left",
+            text=f"Loaded your last settings (saved {cache.get('saved_at', 'earlier')}). "
+                 "Edit anything below and re-apply, or just Apply again to reconfirm.",
+        ).pack(fill="x", padx=10, pady=(4, 0))
+
+    p_owners_cached = cp.get("owners", [])
+    w_owners_cached = cw.get("owners", [])
+
     folder_frame = add_section(body, "Personal folder")
-    add_row(folder_frame, "personal_folder", "Folder", str(home / "Projects" / "Personal"), browse="dir")
+    add_row(folder_frame, "personal_folder", "Folder",
+            cache.get("personal_folder", str(home / "Projects" / "Personal")), browse="dir")
 
     p_frame = add_section(body, "Personal account")
-    add_row(p_frame, "p_name", "Git author name", "")
-    add_row(p_frame, "p_email", "Git email", "")
-    add_row(p_frame, "p_owner", "GitHub username", "")
-    add_row(p_frame, "p_extra_owners", "Other owners/orgs (comma-sep, optional)", "")
-    add_check(p_frame, "p_generate", "Generate a new SSH key for this account", True)
-    add_row(p_frame, "p_key", "SSH private key path", str(home / ".ssh" / "id_ed25519_personal"), browse="file")
+    add_row(p_frame, "p_name", "Git author name", cp.get("name", ""))
+    add_row(p_frame, "p_email", "Git email", cp.get("email", ""))
+    add_row(p_frame, "p_owner", "GitHub username", p_owners_cached[0] if p_owners_cached else "")
+    add_row(p_frame, "p_extra_owners", "Other owners/orgs (comma-sep, optional)",
+            ", ".join(p_owners_cached[1:]))
+    add_check(p_frame, "p_generate", "Generate a new SSH key for this account", cp.get("generate_key", True))
+    add_row(p_frame, "p_key", "SSH private key path",
+            cp.get("key_path", str(home / ".ssh" / "id_ed25519_personal")), browse="file")
 
     w_frame = add_section(body, "Work account")
-    add_row(w_frame, "w_name", "Git author name", "")
-    add_row(w_frame, "w_email", "Git email", "")
-    add_row(w_frame, "w_owner", "GitHub username or org", "")
-    add_row(w_frame, "w_extra_owners", "Other owners/orgs (comma-sep, optional)", "")
-    add_check(w_frame, "w_generate", "Generate a new SSH key for this account", True)
-    add_row(w_frame, "w_key", "SSH private key path", str(home / ".ssh" / "id_ed25519_work"), browse="file")
+    add_row(w_frame, "w_name", "Git author name", cw.get("name", ""))
+    add_row(w_frame, "w_email", "Git email", cw.get("email", ""))
+    add_row(w_frame, "w_owner", "GitHub username or org", w_owners_cached[0] if w_owners_cached else "")
+    add_row(w_frame, "w_extra_owners", "Other owners/orgs (comma-sep, optional)",
+            ", ".join(w_owners_cached[1:]))
+    add_check(w_frame, "w_generate", "Generate a new SSH key for this account", cw.get("generate_key", True))
+    add_row(w_frame, "w_key", "SSH private key path",
+            cw.get("key_path", str(home / ".ssh" / "id_ed25519_work")), browse="file")
 
     adv_frame = add_section(body, "Advanced")
-    add_row(adv_frame, "hooks_dir", "Hooks directory", str(home / ".githooks"), browse="dir")
+    add_row(adv_frame, "hooks_dir", "Hooks directory", cache.get("hooks_dir", str(home / ".githooks")), browse="dir")
     add_check(adv_frame, "dry_run", "Dry run (preview only, write nothing)", False)
 
     log_frame = add_section(body, "Log")
