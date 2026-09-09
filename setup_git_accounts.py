@@ -1,36 +1,37 @@
 #!/usr/bin/env python3
 """
-git_account_setup.py -- separate two GitHub accounts (e.g. personal + work)
-on one machine.
+git_account_setup.py -- separate multiple Git hosting accounts (GitHub,
+GitLab, or any self-hosted host) on one machine.
 
-What it sets up, per account:
-  - an SSH host alias (~/.ssh/config) pointing at github.com with a
-    dedicated key, IdentitiesOnly yes
+For each account you configure:
+  - an SSH host alias (~/.ssh/config) pointing at that account's git host,
+    with a dedicated key and IdentitiesOnly yes
   - a small identity file (~/.gitconfig-<label>) with [user] name/email
   - owner-scoped URL rewriting in ~/.gitconfig, so ANY
-    https://github.com/<owner>/... remote -- typed by hand, `git clone`,
-    a GUI client, whatever -- is transparently rewritten to the right
-    SSH alias. This is scoped per GitHub owner (not a single blanket
-    rule), so it works correctly no matter which folder you're in or how
-    the remote was added -- there is no "new repo created outside the
-    wrapper" gap.
-  - includeIf rules so git picks the right [user] identity from either
-    the folder a repo lives in (one designated folder = the "personal"
-    account; everywhere else defaults to "work") or the remote URL/host
-    alias it points at, whichever is known first.
-  - pre-commit / pre-push hooks (via core.hooksPath) that refuse to
-    commit or push under the wrong identity for a given remote, so a
-    misconfigured repo fails loudly and locally instead of leaking the
-    wrong account upstream.
-  - `git whoami`, `git use-personal`, `git use-work`, `git clone-personal`,
-    `git clone-work` aliases.
+    https://<host>/<owner>/... remote -- typed by hand, `git clone`, a GUI
+    client, whatever -- is transparently rewritten to the right SSH alias.
+    This is scoped per (host, owner) pair, not a single blanket rule, so it
+    works correctly no matter which folder you're in or how the remote was
+    added -- there is no "new repo created outside a shell wrapper" gap.
+  - an optional dedicated folder: repos under it always use that account's
+    identity, even before a remote exists. At most one account can also be
+    marked "default", used for repos that live outside every dedicated
+    folder and have no matching remote yet.
+  - `git whoami`, `git use-<label>`, `git clone-<label>` aliases.
+
+One pair of hooks (pre-commit, pre-push), wired up via core.hooksPath,
+refuses to commit or push under the wrong identity for a given remote --
+matching is by host+owner, not tied to GitHub specifically, so GitLab and
+self-hosted remotes are guarded exactly the same way. Every other hook name
+gets a small pass-through stub so repo-local hooks (husky, lint-staged,
+...) still run.
 
 Every write is preceded by a timestamped backup of the files it touches,
 and re-running the script is idempotent (it replaces its own previously
 written block instead of duplicating it).
 
-On a successful (non-dry-run) apply, the answers you gave -- folder, names,
-emails, owners, key paths; never key contents -- are cached to
+On a successful (non-dry-run) apply, your answers -- labels, hosts, names,
+emails, owners, folders, key paths; never key contents -- are cached to
 ~/.git-account-setup-cache.json and used to prefill the wizard next time you
 open it, so you can see/tweak your last configuration instead of retyping it.
 
@@ -49,9 +50,9 @@ import argparse
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
-import sys
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +61,8 @@ BEGIN_MARK = "# >>> git-multi-account (managed by git_account_setup.py) >>>"
 END_MARK = "# <<< git-multi-account (managed by git_account_setup.py) <<<"
 
 CACHE_FILE = Path.home() / ".git-account-setup-cache.json"
+
+LABEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 STUB_HOOK_NAMES = [
     "applypatch-msg", "pre-applypatch", "post-applypatch",
@@ -84,6 +87,12 @@ fi
 exit 0
 """
 
+# Strips a leading https://<host>/, git@<host>:, or ssh://git@<host>/ from a
+# remote URL, leaving "<owner>/<repo>[.git]" -- works for any host, not just
+# github.com, so GitHub, GitLab and self-hosted remotes are all handled the
+# same way.
+STRIP_HOST_SED = r"sed -E 's#^(https://[^/]+/|git@[^:]+:|ssh://git@[^/]+/)##'"
+
 
 def to_posix(p: Path) -> str:
     """git config / ssh config always want forward slashes, even on Windows."""
@@ -92,12 +101,15 @@ def to_posix(p: Path) -> str:
 
 @dataclass
 class Account:
-    label: str            # short id used as SSH host alias & hook/alias names, e.g. "personal", "work"
-    name: str              # git author name
+    label: str              # unique short id: SSH host alias & hook/alias names
+    name: str                # git author name
     email: str
-    owners: list[str]      # GitHub usernames/orgs that belong to this account
+    host: str                # git hosting domain, e.g. github.com, gitlab.com, git.example.com
+    owners: list[str]        # usernames/orgs on that host that belong to this account
     key_path: Path
     generate_key: bool = False
+    folder: Path | None = None   # dedicated folder; None = identified by remote only
+    is_default: bool = False     # used for repos outside every folder with no matching remote
 
     @property
     def identity_file(self) -> Path:
@@ -106,52 +118,51 @@ class Account:
 
 @dataclass
 class SetupConfig:
-    personal: Account
-    work: Account
-    personal_folder: Path
+    accounts: list[Account]
     hooks_dir: Path = field(default_factory=lambda: Path.home() / ".githooks")
     home: Path = field(default_factory=Path.home)
 
+    @property
+    def default_account(self) -> Account | None:
+        for a in self.accounts:
+            if a.is_default:
+                return a
+        return None
+
+
+def validate_accounts(accounts: list[Account]) -> list[str]:
+    errors = []
+    if not accounts:
+        errors.append("at least one account is required")
+    labels_seen = {}
+    owner_pairs_seen = {}
+    defaults = 0
+    for a in accounts:
+        if not LABEL_RE.match(a.label or ""):
+            errors.append(f"label '{a.label}' must contain only letters, digits, - or _")
+        key = a.label.lower()
+        if key in labels_seen:
+            errors.append(f"label '{a.label}' is used more than once")
+        labels_seen[key] = True
+        if not a.email:
+            errors.append(f"account '{a.label}': email is required")
+        if not a.owners or not a.owners[0]:
+            errors.append(f"account '{a.label}': at least one owner/username is required")
+        for owner in a.owners:
+            pair = (a.host.lower(), owner.lower())
+            if pair in owner_pairs_seen:
+                errors.append(
+                    f"'{a.host}/{owner}' is claimed by both '{owner_pairs_seen[pair]}' and '{a.label}'"
+                )
+            owner_pairs_seen[pair] = a.label
+        if a.is_default:
+            defaults += 1
+    if defaults > 1:
+        errors.append("only one account can be the default")
+    return errors
+
 
 LogFn = "callable"
-
-
-# --------------------------------------------------------------------------
-# cache -- remembers the last answers you gave (never key contents) so the
-# wizard opens pre-filled with what you last set up
-# --------------------------------------------------------------------------
-
-def load_cache() -> dict:
-    if not CACHE_FILE.exists():
-        return {}
-    try:
-        return json.loads(CACHE_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def account_to_cache(acct: Account) -> dict:
-    return {
-        "name": acct.name,
-        "email": acct.email,
-        "owners": acct.owners,
-        "key_path": str(acct.key_path),
-        "generate_key": acct.generate_key,
-    }
-
-
-def save_cache(cfg: SetupConfig) -> None:
-    data = {
-        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        "personal_folder": str(cfg.personal_folder),
-        "hooks_dir": str(cfg.hooks_dir),
-        "personal": account_to_cache(cfg.personal),
-        "work": account_to_cache(cfg.work),
-    }
-    try:
-        CACHE_FILE.write_text(json.dumps(data, indent=2), newline="\n")
-    except OSError:
-        pass
 
 
 def run(cmd: list[str], log) -> None:
@@ -170,6 +181,46 @@ def backup_existing(home: Path, paths: list[Path], log) -> Path | None:
         shutil.copy2(p, backup_dir / p.name)
     log(f"backed up {len(existing)} existing file(s) to {backup_dir}")
     return backup_dir
+
+
+# --------------------------------------------------------------------------
+# cache -- remembers the last answers you gave (never key contents) so the
+# wizard opens pre-filled with what you last set up
+# --------------------------------------------------------------------------
+
+def load_cache() -> dict:
+    if not CACHE_FILE.exists():
+        return {}
+    try:
+        return json.loads(CACHE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def account_to_cache(acct: Account) -> dict:
+    return {
+        "label": acct.label,
+        "name": acct.name,
+        "email": acct.email,
+        "host": acct.host,
+        "owners": acct.owners,
+        "key_path": str(acct.key_path),
+        "generate_key": acct.generate_key,
+        "folder": str(acct.folder) if acct.folder else "",
+        "is_default": acct.is_default,
+    }
+
+
+def save_cache(cfg: SetupConfig) -> None:
+    data = {
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "hooks_dir": str(cfg.hooks_dir),
+        "accounts": [account_to_cache(a) for a in cfg.accounts],
+    }
+    try:
+        CACHE_FILE.write_text(json.dumps(data, indent=2), newline="\n")
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -206,13 +257,13 @@ def write_ssh_config(cfg: SetupConfig, dry_run: bool, log) -> None:
     existing = ssh_cfg_path.read_text() if ssh_cfg_path.exists() else ""
 
     new_blocks = []
-    for acct in (cfg.personal, cfg.work):
+    for acct in cfg.accounts:
         if f"Host {acct.label}\n" in existing or existing.strip() == f"Host {acct.label}":
             log(f"  ~/.ssh/config already has 'Host {acct.label}' -- leaving it untouched")
             continue
         new_blocks.append(
             f"Host {acct.label}\n"
-            f"    HostName github.com\n"
+            f"    HostName {acct.host}\n"
             f"    User git\n"
             f"    IdentityFile {to_posix(acct.key_path)}\n"
             f"    IdentitiesOnly yes\n"
@@ -242,12 +293,12 @@ def write_ssh_config(cfg: SetupConfig, dry_run: bool, log) -> None:
 
 def write_identity_file(acct: Account, dry_run: bool, log) -> None:
     content = (
-        f"# {acct.label} GitHub identity -- managed by git_account_setup.py\n"
+        f"# {acct.label} identity ({acct.host}) -- managed by git_account_setup.py\n"
         f"[user]\n"
         f"\tname = {acct.name}\n"
         f"\temail = {acct.email}\n"
         f"\n"
-        f'[credential "https://github.com"]\n'
+        f'[credential "https://{acct.host}"]\n'
         f"\tusername = {acct.owners[0]}\n"
     )
     log(f"  writing {acct.identity_file}")
@@ -257,46 +308,53 @@ def write_identity_file(acct: Account, dry_run: bool, log) -> None:
 
 def build_managed_block(cfg: SetupConfig) -> str:
     lines = [BEGIN_MARK]
-    lines.append(f"# personal: {', '.join(cfg.personal.owners)} <{cfg.personal.email}>")
-    lines.append(f"# work:     {', '.join(cfg.work.owners)} <{cfg.work.email}>")
+    for a in cfg.accounts:
+        tag = " [default]" if a.is_default else ""
+        folder_note = f" folder={to_posix(a.folder)}" if a.folder else ""
+        lines.append(f"# {a.label}: {a.host}/{', '.join(a.owners)} <{a.email}>{folder_note}{tag}")
 
     # Default identity. Git config is "last value in file order wins", and an
     # includeIf's content is spliced in at the point the includeIf directive
     # appears -- so this [user] block MUST come before the includeIf rules
     # below, or the default would always win over any conditional match.
-    lines.append("[user]")
-    lines.append(f"\tname = {cfg.work.name}")
-    lines.append(f"\temail = {cfg.work.email}")
+    default_acct = cfg.default_account
+    if default_acct is not None:
+        lines.append("[user]")
+        lines.append(f"\tname = {default_acct.name}")
+        lines.append(f"\temail = {default_acct.email}")
 
-    # Owner-scoped URL rewriting: any https://github.com/<owner>/... remote
-    # is rewritten to the right SSH alias, regardless of current folder or
-    # how the remote was added (init+remote add, clone, GUI client, ...).
-    for acct in (cfg.personal, cfg.work):
-        for owner in acct.owners:
-            lines.append(f'[url "git@{acct.label}:"]')
-            lines.append(f"\tinsteadOf = https://github.com/{owner}/")
+    # Owner-scoped URL rewriting: any https://<host>/<owner>/... remote is
+    # rewritten to the right SSH alias, regardless of current folder or how
+    # the remote was added (init+remote add, clone, GUI client, ...).
+    for a in cfg.accounts:
+        for owner in a.owners:
+            lines.append(f'[url "git@{a.label}:"]')
+            lines.append(f"\tinsteadOf = https://{a.host}/{owner}/")
 
-    # Folder rule: this designated folder always uses the personal identity,
+    # Folder rules: a designated folder always uses that account's identity,
     # even before a remote exists (e.g. `git init` + first commit).
-    folder = to_posix(cfg.personal_folder)
-    if not folder.endswith("/"):
-        folder += "/"
-    lines.append(f'[includeIf "gitdir/i:{folder}"]')
-    lines.append(f"\tpath = {to_posix(cfg.personal.identity_file)}")
+    for a in cfg.accounts:
+        if not a.folder:
+            continue
+        folder = to_posix(a.folder)
+        if not folder.endswith("/"):
+            folder += "/"
+        lines.append(f'[includeIf "gitdir/i:{folder}"]')
+        lines.append(f"\tpath = {to_posix(a.identity_file)}")
 
     # Remote-based rules: whichever identity matches the actual remote wins,
-    # so a personal repo living outside the personal folder (or vice versa)
-    # still gets the right author once a remote is attached.
-    for acct in (cfg.personal, cfg.work):
+    # so an account's repo living outside its folder (or with no folder at
+    # all) still gets the right author once a remote is attached.
+    for a in cfg.accounts:
         for pattern in (
-            f"git@{acct.label}:**/**",
-            f"ssh://git@{acct.label}/**",
+            f"git@{a.label}:**/**",
+            f"ssh://git@{a.label}/**",
         ):
             lines.append(f'[includeIf "hasconfig:remote.*.url:{pattern}"]')
-            lines.append(f"\tpath = {to_posix(acct.identity_file)}")
-        for owner in acct.owners:
-            lines.append(f'[includeIf "hasconfig:remote.*.url:https://github.com/{owner}/**"]')
-            lines.append(f"\tpath = {to_posix(acct.identity_file)}")
+            lines.append(f"\tpath = {to_posix(a.identity_file)}")
+        for owner in a.owners:
+            lines.append(f'[includeIf "hasconfig:remote.*.url:https://{a.host}/{owner}/**"]')
+            lines.append(f"\tpath = {to_posix(a.identity_file)}")
 
     lines.append(END_MARK)
     return "\n".join(lines) + "\n"
@@ -312,8 +370,8 @@ def strip_managed_block(content: str) -> str:
 
 def whoami_alias(cfg: SetupConfig) -> str:
     cases = "".join(
-        f"{acct.email}) echo '{acct.label.upper()} ({acct.owners[0]})';; "
-        for acct in (cfg.personal, cfg.work)
+        f"{a.email}) echo '{a.label.upper()} ({a.host}/{a.owners[0]})';; "
+        for a in cfg.accounts
     )
     return (
         "!f() { printf 'account : %s\\nname    : %s\\nemail   : %s\\nremote  : %s\\n' "
@@ -327,14 +385,13 @@ def use_alias(acct: Account) -> str:
     return (
         f'!f() {{ git config user.name "{acct.name}" '
         f'&& git config user.email "{acct.email}" '
-        f'&& echo "this repo -> {acct.label.upper()} ({acct.owners[0]})"; }}; f'
+        f'&& echo "this repo -> {acct.label.upper()} ({acct.host}/{acct.owners[0]})"; }}; f'
     )
 
 
 def clone_alias(label: str) -> str:
     return (
-        "!f() { r=$(printf '%s' \"$1\" | sed -e 's|^https://github.com/||' "
-        "-e 's|^git@[^:]*:||' -e 's|^ssh://git@[^/]*/||'); r=${r%.git}; shift; "
+        f"!f() {{ r=$(printf '%s' \"$1\" | {STRIP_HOST_SED}); r=${{r%.git}}; shift; "
         f'git clone "git@{label}:$r.git" "$@"; }}; f'
     )
 
@@ -369,10 +426,9 @@ def update_global_gitconfig(cfg: SetupConfig, dry_run: bool, log) -> None:
         git_config(["init.defaultBranch", "main"])
 
     git_config(["alias.whoami", whoami_alias(cfg)])
-    git_config(["alias.use-personal", use_alias(cfg.personal)])
-    git_config(["alias.use-work", use_alias(cfg.work)])
-    git_config(["alias.clone-personal", clone_alias(cfg.personal.label)])
-    git_config(["alias.clone-work", clone_alias(cfg.work.label)])
+    for a in cfg.accounts:
+        git_config([f"alias.use-{a.label}", use_alias(a)])
+        git_config([f"alias.clone-{a.label}", clone_alias(a.label)])
 
 
 # --------------------------------------------------------------------------
@@ -381,16 +437,16 @@ def update_global_gitconfig(cfg: SetupConfig, dry_run: bool, log) -> None:
 
 def build_pre_commit(cfg: SetupConfig) -> str:
     cases = "\n".join(
-        f'    {acct.label}:*|ssh://git@{acct.label}/*|{acct.label}:*)\n'
-        f'        expected="{acct.email}"; label=\'{acct.label.upper()} '
-        f"(github.com/{acct.owners[0]})'; fix='git use-{acct.label}' ;;"
-        .replace(f"{acct.label}:*|", f"git@{acct.label}:*|")
-        for acct in (cfg.personal, cfg.work)
+        f'    git@{a.label}:*|ssh://git@{a.label}/*|{a.label}:*)\n'
+        f"        expected=\"{a.email}\"; label='{a.label.upper()} "
+        f"({a.host}/{a.owners[0]})'; fix='git use-{a.label}' ;;"
+        for a in cfg.accounts
     )
     return f"""\
 #!/bin/sh
 # Identity guard, commit-time. Blocks a commit whose author address does not
-# match the GitHub account this repo's origin belongs to.
+# match the account this repo's origin belongs to (matched by host alias, so
+# this works the same for GitHub, GitLab, or any self-hosted remote).
 url=$(git remote get-url origin 2>/dev/null)
 case "$url" in
 {cases}
@@ -424,20 +480,22 @@ exit 0
 
 
 def build_pre_push(cfg: SetupConfig) -> str:
-    other = {cfg.personal.label: cfg.work, cfg.work.label: cfg.personal}
     cases = []
-    for acct in (cfg.personal, cfg.work):
-        forbidden = other[acct.label].email
+    for acct in cfg.accounts:
+        forbidden_emails = " ".join(a.email for a in cfg.accounts if a.label != acct.label)
         cases.append(
             f'    git@{acct.label}:*|ssh://git@{acct.label}/*|{acct.label}:*)\n'
-            f'        account="{acct.label.upper()} (github.com/{acct.owners[0]})"; '
-            f'expected="{acct.email}"; forbidden="{forbidden}" ;;'
+            f'        account="{acct.label.upper()} ({acct.host}/{acct.owners[0]})"; '
+            f'expected="{acct.email}"; forbidden_emails="{forbidden_emails}" ;;'
         )
     cases_str = "\n".join(cases)
+    alias_hints = "\n".join(f"    git remote set-url $remote_name git@{a.label}:<owner>/<repo>.git" for a in cfg.accounts)
+    fix_hints = "   or   ".join(f"git use-{a.label}" for a in cfg.accounts)
     return f"""\
 #!/bin/sh
 # Identity guard, push-time. Refuses to send commits authored with the wrong
-# account's address for this remote.
+# account's address for this remote. Matching is by host alias, so this
+# works the same for GitHub, GitLab, or any self-hosted remote.
 remote_name="$1"
 remote_url="$2"
 input=$(cat)
@@ -454,18 +512,17 @@ chain_local () {{
 
 case "$remote_url" in
 {cases_str}
-    *github.com*)
+    https://*|git@*:*|ssh://git@*/*)
         cat >&2 <<MSG
 
-  PUSH BLOCKED -- ambiguous GitHub remote
+  PUSH BLOCKED -- unrecognized remote
 
     remote: $remote_url
 
-  This URL does not say which of your accounts it belongs to. Point it at a
-  host alias instead, e.g.:
+  This URL doesn't match any configured account's host alias, so the guard
+  can't check it. Point it at a host alias instead, e.g.:
 
-    git remote set-url $remote_name git@{cfg.personal.label}:<owner>/<repo>.git
-    git remote set-url $remote_name git@{cfg.work.label}:<owner>/<repo>.git
+{alias_hints}
 
   Override (not recommended):  git push --no-verify
 
@@ -484,7 +541,7 @@ if [ "$configured" != "$expected" ]; then
     expected author   : $expected
     currently set to  : ${{configured:-<none>}}
 
-  Fix with:  git use-{cfg.personal.label}   or   git use-{cfg.work.label}
+  Fix with:  {fix_hints}
 
 MSG
     exit 1
@@ -502,16 +559,18 @@ printf '%s\\n' "$input" | while read -r local_ref local_sha remote_ref remote_sh
     else
         set -- "$remote_sha..$local_sha"
     fi
-    git log "$@" --author="$forbidden" --format='%h  %an <%ae>  %s' 2>/dev/null >> "$offenders"
+    for femail in $forbidden_emails; do
+        git log "$@" --author="$femail" --format='%h  %an <%ae>  %s' 2>/dev/null >> "$offenders"
+    done
 done
 
 if [ -s "$offenders" ]; then
     cat >&2 <<MSG
 
-  PUSH BLOCKED -- commits authored with the other account
+  PUSH BLOCKED -- commits authored with another account
 
     remote belongs to : $account
-    but these commits were authored as $forbidden
+    but these commits were authored under a different account:
 
 MSG
     sed 's/^/    /' "$offenders" >&2
@@ -533,26 +592,33 @@ chain_local
 
 
 def build_post_checkout(cfg: SetupConfig) -> str:
-    folder_lower = str(cfg.personal_folder).replace("\\", "/").lower()
+    folder_accounts = [a for a in cfg.accounts if a.folder]
+    case_lines = []
+    for a in folder_accounts:
+        folder_lower = str(a.folder).replace("\\", "/").lower()
+        case_lines.append(f'    {folder_lower}|{folder_lower}/*) retarget "{a.label}" ;;')
+    cases_str = "\n".join(case_lines) if case_lines else "    *) : ;;"
     return f"""\
 #!/bin/sh
-# A repo cloned into the personal folder should talk to GitHub as the
-# personal account, so retarget a bare github.com origin at the personal
+# A repo cloned into a designated folder should talk to its git host as that
+# folder's account, so retarget a bare (not-yet-aliased) origin at the right
 # SSH alias (belt-and-suspenders: the owner-scoped insteadOf rule in
-# ~/.gitconfig should already have rewritten it before clone).
+# ~/.gitconfig should already have rewritten it before clone). Works for any
+# host (GitHub, GitLab, self-hosted) since the strip below is host-agnostic.
+retarget () {{
+    url=$(git remote get-url origin 2>/dev/null)
+    case "$url" in
+        https://*|git@*:*|ssh://git@*/*)
+            repo=$(printf '%s' "$url" | {STRIP_HOST_SED})
+            git remote set-url origin "git@$1:$repo"
+            echo "  note: origin retargeted -> git@$1:$repo" >&2 ;;
+    esac
+}}
+
 top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 lower=$(printf '%s' "$top" | tr 'A-Z' 'a-z')
 case "$lower" in
-    {folder_lower}|{folder_lower}/*)
-        url=$(git remote get-url origin 2>/dev/null)
-        case "$url" in
-            https://github.com/*|git@github.com:*|ssh://git@github.com/*)
-                repo=$(printf '%s' "$url" | sed -e 's|^https://github.com/||' \\
-                                                -e 's|^git@github.com:||' \\
-                                                -e 's|^ssh://git@github.com/||')
-                git remote set-url origin "git@{cfg.personal.label}:$repo"
-                echo "  note: origin retargeted to the personal account -> git@{cfg.personal.label}:$repo" >&2 ;;
-        esac ;;
+{cases_str}
 esac
 
 gitdir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0
@@ -591,28 +657,30 @@ def write_hooks(cfg: SetupConfig, dry_run: bool, log) -> None:
 # --------------------------------------------------------------------------
 
 def apply_config(cfg: SetupConfig, dry_run: bool, log) -> None:
+    errors = validate_accounts(cfg.accounts)
+    if errors:
+        for e in errors:
+            log(f"  ERROR: {e}")
+        raise ValueError("invalid configuration:\n" + "\n".join(errors))
+
     log("== backing up existing files ==")
-    to_backup = [
-        cfg.home / ".gitconfig",
-        cfg.home / ".ssh" / "config",
-        cfg.personal.identity_file,
-        cfg.work.identity_file,
-    ]
+    to_backup = [cfg.home / ".gitconfig", cfg.home / ".ssh" / "config"]
+    to_backup += [a.identity_file for a in cfg.accounts]
     if not dry_run:
         backup_existing(cfg.home, to_backup, log)
     else:
         log("  (skipped: --dry-run)")
 
     log("== SSH keys ==")
-    ensure_ssh_key(cfg.personal, dry_run, log)
-    ensure_ssh_key(cfg.work, dry_run, log)
+    for a in cfg.accounts:
+        ensure_ssh_key(a, dry_run, log)
 
     log("== SSH config ==")
     write_ssh_config(cfg, dry_run, log)
 
     log("== identity files ==")
-    write_identity_file(cfg.personal, dry_run, log)
-    write_identity_file(cfg.work, dry_run, log)
+    for a in cfg.accounts:
+        write_identity_file(a, dry_run, log)
 
     log("== global .gitconfig ==")
     update_global_gitconfig(cfg, dry_run, log)
@@ -629,8 +697,8 @@ def apply_config(cfg: SetupConfig, dry_run: bool, log) -> None:
     log("")
     log("Verify with, from any repo:")
     log("  git whoami")
-    log(f"  ssh -T git@{cfg.personal.label}")
-    log(f"  ssh -T git@{cfg.work.label}")
+    for a in cfg.accounts:
+        log(f"  ssh -T git@{a.label}")
 
 
 # --------------------------------------------------------------------------
@@ -665,50 +733,68 @@ def cli_wizard() -> SetupConfig:
 
     home = Path.home()
     cache = load_cache()
+    cached_accounts = cache.get("accounts", [])
     if cache:
         print(f"(prefilled from {CACHE_FILE}, saved {cache.get('saved_at', 'earlier')} "
-              "-- press Enter to keep a value, or type a new one)\n")
-    cp = cache.get("personal", {})
-    cw = cache.get("work", {})
+              "-- press Enter to keep a value, or type a new one)")
 
-    default_personal_folder = cache.get("personal_folder", str(home / "Projects" / "Personal"))
-    personal_folder = Path(prompt(
-        "Folder that should ALWAYS use the personal account (everything else defaults to work)",
-        default_personal_folder,
-    ))
+    print("Add each account you want to keep separate on this machine "
+          "(GitHub, GitLab, or a self-hosted git server).\n")
 
-    print("\n-- Personal account --")
-    p_owners_cached = cp.get("owners", [])
-    p_owner = prompt_required("  GitHub username", p_owners_cached[0] if p_owners_cached else "")
-    p_name = prompt("  Git author name", cp.get("name", p_owner))
-    p_email = prompt_required("  Git email", cp.get("email", ""))
-    p_extra_owners = prompt(
-        "  Any other GitHub owners/orgs for this account (comma-separated, optional)",
-        ", ".join(p_owners_cached[1:]),
+    accounts: list[Account] = []
+    used_labels: set[str] = set()
+    i = 0
+    while True:
+        c = cached_accounts[i] if i < len(cached_accounts) else {}
+        print(f"-- Account {i + 1} --")
+        while True:
+            label = prompt_required("  Short label (used for SSH alias & git aliases, e.g. personal/work/client1)",
+                                     c.get("label", ""))
+            if not LABEL_RE.match(label):
+                print("  letters, digits, - and _ only, please.")
+                continue
+            if label.lower() in used_labels:
+                print(f"  '{label}' is already used -- pick another.")
+                continue
+            break
+        used_labels.add(label.lower())
+
+        host = prompt("  Git host (github.com, gitlab.com, or a self-hosted domain)",
+                       c.get("host", "github.com"))
+        owners_cached = c.get("owners", [])
+        owner = prompt_required(f"  Username or org on {host}", owners_cached[0] if owners_cached else "")
+        extra = prompt("  Other owners/orgs on this host for this account (comma-separated, optional)",
+                        ", ".join(owners_cached[1:]))
+        owners = [owner] + [o.strip() for o in extra.split(",") if o.strip()]
+        name = prompt("  Git author name", c.get("name", owner))
+        email = prompt_required("  Git email", c.get("email", ""))
+        folder_in = prompt("  Dedicated folder for this account (optional -- blank = identify by remote only)",
+                            c.get("folder", ""))
+        folder = Path(folder_in) if folder_in else None
+        generate = prompt_yn("  Generate a new SSH key for this account?", c.get("generate_key", True))
+        key_path = Path(prompt("  SSH private key path",
+                                c.get("key_path", str(home / ".ssh" / f"id_ed25519_{label}"))))
+
+        accounts.append(Account(label, name, email, host, owners, key_path, generate, folder, False))
+        i += 1
+        print()
+        if not prompt_yn("Add another account?", i < len(cached_accounts)):
+            break
+        print()
+
+    print("\nAccounts configured:", ", ".join(a.label for a in accounts))
+    cached_default = cache.get("accounts", [])
+    cached_default_label = next((a["label"] for a in cached_default if a.get("is_default")), "")
+    default_label = prompt(
+        "Which account should be used for repos outside every dedicated folder with no matching "
+        "remote yet? (blank = none)",
+        cached_default_label if cached_default_label in used_labels else "",
     )
-    p_owners = [p_owner] + [o.strip() for o in p_extra_owners.split(",") if o.strip()]
-    p_generate = prompt_yn("  Generate a new SSH key for this account?", cp.get("generate_key", True))
-    p_key = Path(prompt("  SSH private key path", cp.get("key_path", str(home / ".ssh" / "id_ed25519_personal"))))
+    for a in accounts:
+        a.is_default = (a.label == default_label)
 
-    print("\n-- Work account --")
-    w_owners_cached = cw.get("owners", [])
-    w_owner = prompt_required("  GitHub username or org", w_owners_cached[0] if w_owners_cached else "")
-    w_name = prompt("  Git author name", cw.get("name", w_owner))
-    w_email = prompt_required("  Git email", cw.get("email", ""))
-    w_extra_owners = prompt(
-        "  Any other GitHub owners/orgs for this account (comma-separated, optional)",
-        ", ".join(w_owners_cached[1:]),
-    )
-    w_owners = [w_owner] + [o.strip() for o in w_extra_owners.split(",") if o.strip()]
-    w_generate = prompt_yn("  Generate a new SSH key for this account?", cw.get("generate_key", True))
-    w_key = Path(prompt("  SSH private key path", cw.get("key_path", str(home / ".ssh" / "id_ed25519_work"))))
-
-    personal = Account("personal", p_name, p_email, p_owners, p_key, p_generate)
-    work = Account("work", w_name, w_email, w_owners, w_key, w_generate)
     return SetupConfig(
-        personal=personal,
-        work=work,
-        personal_folder=personal_folder,
+        accounts=accounts,
         hooks_dir=Path(cache.get("hooks_dir", str(home / ".githooks"))),
     )
 
@@ -723,47 +809,15 @@ def gui_wizard() -> None:
 
     home = Path.home()
     cache = load_cache()
-    cp = cache.get("personal", {})
-    cw = cache.get("work", {})
+    cached_accounts = cache.get("accounts", [])
 
     root = tk.Tk()
     root.title("Git multi-account setup")
-    root.geometry("640x720")
+    root.geometry("700x820")
 
-    vars_ = {}
-
-    def add_section(parent, title):
-        frame = ttk.LabelFrame(parent, text=title, padding=10)
-        frame.pack(fill="x", padx=10, pady=6)
-        return frame
-
-    def add_row(frame, key, label, default="", browse=None):
-        row = ttk.Frame(frame)
-        row.pack(fill="x", pady=2)
-        ttk.Label(row, text=label, width=26).pack(side="left")
-        var = tk.StringVar(value=default)
-        entry = ttk.Entry(row, textvariable=var)
-        entry.pack(side="left", fill="x", expand=True)
-        vars_[key] = var
-        if browse == "dir":
-            def do_browse():
-                d = filedialog.askdirectory(initialdir=var.get() or str(home))
-                if d:
-                    var.set(d)
-            ttk.Button(row, text="Browse", command=do_browse).pack(side="left", padx=4)
-        elif browse == "file":
-            def do_browse():
-                f = filedialog.askopenfilename(initialdir=str(Path(var.get()).parent) if var.get() else str(home / ".ssh"))
-                if f:
-                    var.set(f)
-            ttk.Button(row, text="Browse", command=do_browse).pack(side="left", padx=4)
-        return var
-
-    def add_check(frame, key, label, default=True):
-        var = tk.BooleanVar(value=default)
-        ttk.Checkbutton(frame, text=label, variable=var).pack(anchor="w", pady=2)
-        vars_[key] = var
-        return var
+    default_var = tk.StringVar(value="")  # holds the internal id of the default account, or ""
+    account_rows: dict[str, dict] = {}     # internal_id -> {vars..., frame}
+    next_id = [0]
 
     canvas = tk.Canvas(root, borderwidth=0)
     scrollbar = ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
@@ -774,58 +828,23 @@ def gui_wizard() -> None:
     canvas.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
 
-    intro = ttk.Label(
-        body,
-        wraplength=580,
-        justify="left",
-        text=(
-            "This designates one folder that always uses your PERSONAL GitHub "
-            "account. Every other repo defaults to WORK, unless its remote "
-            "points at a personal owner/org, in which case that repo is "
-            "personal too regardless of folder."
-        ),
-    )
-    intro.pack(fill="x", padx=10, pady=(10, 0))
+    ttk.Label(
+        body, wraplength=640, justify="left",
+        text=("Add one entry per account you want to keep separate (GitHub, GitLab, or a "
+              "self-hosted host). Give an account a dedicated folder if repos under it should "
+              "always use it; mark at most one account 'default' for everything else."),
+    ).pack(fill="x", padx=10, pady=(10, 0))
 
     if cache:
         ttk.Label(
-            body, foreground="#2a6", wraplength=580, justify="left",
-            text=f"Loaded your last settings (saved {cache.get('saved_at', 'earlier')}). "
-                 "Edit anything below and re-apply, or just Apply again to reconfirm.",
+            body, foreground="#2a6", wraplength=640, justify="left",
+            text=f"Loaded your last settings (saved {cache.get('saved_at', 'earlier')}).",
         ).pack(fill="x", padx=10, pady=(4, 0))
 
-    p_owners_cached = cp.get("owners", [])
-    w_owners_cached = cw.get("owners", [])
+    accounts_container = ttk.Frame(body)
+    accounts_container.pack(fill="x", padx=0, pady=0)
 
-    folder_frame = add_section(body, "Personal folder")
-    add_row(folder_frame, "personal_folder", "Folder",
-            cache.get("personal_folder", str(home / "Projects" / "Personal")), browse="dir")
-
-    p_frame = add_section(body, "Personal account")
-    add_row(p_frame, "p_name", "Git author name", cp.get("name", ""))
-    add_row(p_frame, "p_email", "Git email", cp.get("email", ""))
-    add_row(p_frame, "p_owner", "GitHub username", p_owners_cached[0] if p_owners_cached else "")
-    add_row(p_frame, "p_extra_owners", "Other owners/orgs (comma-sep, optional)",
-            ", ".join(p_owners_cached[1:]))
-    add_check(p_frame, "p_generate", "Generate a new SSH key for this account", cp.get("generate_key", True))
-    add_row(p_frame, "p_key", "SSH private key path",
-            cp.get("key_path", str(home / ".ssh" / "id_ed25519_personal")), browse="file")
-
-    w_frame = add_section(body, "Work account")
-    add_row(w_frame, "w_name", "Git author name", cw.get("name", ""))
-    add_row(w_frame, "w_email", "Git email", cw.get("email", ""))
-    add_row(w_frame, "w_owner", "GitHub username or org", w_owners_cached[0] if w_owners_cached else "")
-    add_row(w_frame, "w_extra_owners", "Other owners/orgs (comma-sep, optional)",
-            ", ".join(w_owners_cached[1:]))
-    add_check(w_frame, "w_generate", "Generate a new SSH key for this account", cw.get("generate_key", True))
-    add_row(w_frame, "w_key", "SSH private key path",
-            cw.get("key_path", str(home / ".ssh" / "id_ed25519_work")), browse="file")
-
-    adv_frame = add_section(body, "Advanced")
-    add_row(adv_frame, "hooks_dir", "Hooks directory", cache.get("hooks_dir", str(home / ".githooks")), browse="dir")
-    add_check(adv_frame, "dry_run", "Dry run (preview only, write nothing)", False)
-
-    log_frame = add_section(body, "Log")
+    log_frame = ttk.LabelFrame(body, text="Log", padding=10)
     log_box = scrolledtext.ScrolledText(log_frame, height=14, state="disabled", wrap="word")
     log_box.pack(fill="both", expand=True)
 
@@ -836,46 +855,129 @@ def gui_wizard() -> None:
         log_box.configure(state="disabled")
         root.update_idletasks()
 
-    def collect_config() -> SetupConfig:
-        p_owners = [vars_["p_owner"].get().strip()]
-        p_owners += [o.strip() for o in vars_["p_extra_owners"].get().split(",") if o.strip()]
-        w_owners = [vars_["w_owner"].get().strip()]
-        w_owners += [o.strip() for o in vars_["w_extra_owners"].get().split(",") if o.strip()]
+    def add_account_row(cached: dict | None = None):
+        cached = cached or {}
+        internal_id = f"acct{next_id[0]}"
+        next_id[0] += 1
 
-        personal = Account(
-            "personal", vars_["p_name"].get().strip(), vars_["p_email"].get().strip(),
-            p_owners, Path(vars_["p_key"].get().strip()), vars_["p_generate"].get(),
-        )
-        work = Account(
-            "work", vars_["w_name"].get().strip(), vars_["w_email"].get().strip(),
-            w_owners, Path(vars_["w_key"].get().strip()), vars_["w_generate"].get(),
-        )
-        return SetupConfig(
-            personal=personal,
-            work=work,
-            personal_folder=Path(vars_["personal_folder"].get().strip()),
-            hooks_dir=Path(vars_["hooks_dir"].get().strip()),
-        )
+        frame = ttk.LabelFrame(accounts_container, text=f"Account", padding=10)
+        frame.pack(fill="x", padx=10, pady=6)
+
+        vars_ = {}
+
+        def row(label_text, key, default="", browse=None):
+            r = ttk.Frame(frame)
+            r.pack(fill="x", pady=2)
+            ttk.Label(r, text=label_text, width=26).pack(side="left")
+            var = tk.StringVar(value=default)
+            ttk.Entry(r, textvariable=var).pack(side="left", fill="x", expand=True)
+            vars_[key] = var
+            if browse == "dir":
+                def do_browse():
+                    d = filedialog.askdirectory(initialdir=var.get() or str(home))
+                    if d:
+                        var.set(d)
+                ttk.Button(r, text="Browse", command=do_browse).pack(side="left", padx=4)
+            elif browse == "file":
+                def do_browse():
+                    f = filedialog.askopenfilename(
+                        initialdir=str(Path(var.get()).parent) if var.get() else str(home / ".ssh"))
+                    if f:
+                        var.set(f)
+                ttk.Button(r, text="Browse", command=do_browse).pack(side="left", padx=4)
+            return var
+
+        owners_cached = cached.get("owners", [])
+        row("Label (SSH alias, e.g. personal)", "label", cached.get("label", ""))
+        row("Git host", "host", cached.get("host", "github.com"))
+        row("Username or org", "owner", owners_cached[0] if owners_cached else "")
+        row("Other owners/orgs (comma-sep)", "extra_owners", ", ".join(owners_cached[1:]))
+        row("Git author name", "name", cached.get("name", ""))
+        row("Git email", "email", cached.get("email", ""))
+        row("Dedicated folder (optional)", "folder", cached.get("folder", ""), browse="dir")
+
+        gen_var = tk.BooleanVar(value=cached.get("generate_key", True))
+        ttk.Checkbutton(frame, text="Generate a new SSH key for this account", variable=gen_var).pack(anchor="w", pady=2)
+        vars_["generate_key"] = gen_var
+
+        row("SSH private key path", "key_path",
+            cached.get("key_path", str(home / ".ssh" / "id_ed25519_new")), browse="file")
+
+        bottom = ttk.Frame(frame)
+        bottom.pack(fill="x", pady=(6, 0))
+        ttk.Radiobutton(bottom, text="Default (used outside every folder)",
+                         variable=default_var, value=internal_id).pack(side="left")
+
+        def do_remove():
+            if default_var.get() == internal_id:
+                default_var.set("")
+            frame.destroy()
+            account_rows.pop(internal_id, None)
+
+        ttk.Button(bottom, text="Remove account", command=do_remove).pack(side="right")
+
+        account_rows[internal_id] = {"vars": vars_, "frame": frame}
+        if cached.get("is_default"):
+            default_var.set(internal_id)
+
+    if cached_accounts:
+        for c in cached_accounts:
+            add_account_row(c)
+    else:
+        add_account_row()
+        add_account_row()
+
+    add_btn_frame = ttk.Frame(body)
+    add_btn_frame.pack(fill="x", padx=10, pady=(0, 6))
+    ttk.Button(add_btn_frame, text="+ Add another account", command=lambda: add_account_row()).pack(side="left")
+
+    adv_frame = ttk.LabelFrame(body, text="Advanced", padding=10)
+    adv_frame.pack(fill="x", padx=10, pady=6)
+    hooks_var = tk.StringVar(value=cache.get("hooks_dir", str(home / ".githooks")))
+    hr = ttk.Frame(adv_frame)
+    hr.pack(fill="x", pady=2)
+    ttk.Label(hr, text="Hooks directory", width=26).pack(side="left")
+    ttk.Entry(hr, textvariable=hooks_var).pack(side="left", fill="x", expand=True)
+
+    def browse_hooks():
+        d = filedialog.askdirectory(initialdir=hooks_var.get() or str(home))
+        if d:
+            hooks_var.set(d)
+    ttk.Button(hr, text="Browse", command=browse_hooks).pack(side="left", padx=4)
+
+    dry_run_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(adv_frame, text="Dry run (preview only, write nothing)", variable=dry_run_var).pack(anchor="w", pady=2)
+
+    log_frame.pack(fill="both", expand=True, padx=10, pady=6)
+
+    def collect_config() -> SetupConfig:
+        accounts = []
+        for internal_id, row_data in account_rows.items():
+            v = row_data["vars"]
+            owners = [v["owner"].get().strip()]
+            owners += [o.strip() for o in v["extra_owners"].get().split(",") if o.strip()]
+            folder_str = v["folder"].get().strip()
+            accounts.append(Account(
+                label=v["label"].get().strip(),
+                name=v["name"].get().strip() or v["owner"].get().strip(),
+                email=v["email"].get().strip(),
+                host=v["host"].get().strip() or "github.com",
+                owners=owners,
+                key_path=Path(v["key_path"].get().strip()),
+                generate_key=v["generate_key"].get(),
+                folder=Path(folder_str) if folder_str else None,
+                is_default=(default_var.get() == internal_id),
+            ))
+        return SetupConfig(accounts=accounts, hooks_dir=Path(hooks_var.get().strip()))
 
     def on_apply():
         cfg = collect_config()
-        missing = []
-        for label, val in [
-            ("Personal folder", str(cfg.personal_folder)),
-            ("Personal email", cfg.personal.email), ("Personal GitHub username", cfg.personal.owners[0]),
-            ("Work email", cfg.work.email), ("Work GitHub username/org", cfg.work.owners[0]),
-        ]:
-            if not val:
-                missing.append(label)
-        if missing:
-            messagebox.showerror("Missing fields", "Please fill in:\n" + "\n".join(missing))
+        errors = validate_accounts(cfg.accounts)
+        if errors:
+            messagebox.showerror("Fix these first", "\n".join(errors))
             return
-        if not cfg.personal.name:
-            cfg.personal.name = cfg.personal.owners[0]
-        if not cfg.work.name:
-            cfg.work.name = cfg.work.owners[0]
 
-        dry_run = vars_["dry_run"].get()
+        dry_run = dry_run_var.get()
         try:
             apply_config(cfg, dry_run, log)
             if not dry_run:
