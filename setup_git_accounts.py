@@ -326,9 +326,11 @@ def build_managed_block(cfg: SetupConfig) -> str:
     # Owner-scoped URL rewriting: any https://<host>/<owner>/... remote is
     # rewritten to the right SSH alias, regardless of current folder or how
     # the remote was added (init+remote add, clone, GUI client, ...).
+    # insteadOf replaces the whole matched prefix, so the owner must be
+    # repeated in the replacement or it is dropped from the URL.
     for a in cfg.accounts:
         for owner in a.owners:
-            lines.append(f'[url "git@{a.label}:"]')
+            lines.append(f'[url "git@{a.label}:{owner}/"]')
             lines.append(f"\tinsteadOf = https://{a.host}/{owner}/")
 
     # Folder rules: a designated folder always uses that account's identity,
