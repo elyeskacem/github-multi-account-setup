@@ -2,14 +2,17 @@
 
 Portable setup for keeping multiple git hosting accounts separate on one
 machine — any mix of GitHub, GitLab, or self-hosted servers: SSH host
-aliases, per-repo identity, owner-scoped URL rewriting, and commit/push
-guard hooks. Pure Python stdlib (tkinter for the GUI is optional) — works
-on Windows, macOS, and Linux.
+aliases, per-repo identity, owner-scoped URL rewriting, commit/push guard
+hooks, and a GitHub CLI (`gh`) that uses the right account on its own. Pure
+Python stdlib (tkinter for the GUI is optional) — works on Windows, macOS,
+and Linux.
 
 ## Requirements
 
-Python 3.8+, standard library only — no `pip install` needed, no
-`requirements.txt`. The GUI wizard additionally needs `tkinter`, which ships
+Git (with OpenSSH, which Git for Windows includes) and Python 3.8+, standard
+library only — no `pip install` needed, no `requirements.txt`. `gh` is
+installed for you if you use that option. The GUI wizard additionally needs
+`tkinter`, which ships
 with the standard installer on Windows and macOS; on Linux it's a separate
 OS package if missing:
 
@@ -59,7 +62,7 @@ whichever account claims them, regardless of which folder the repo is in.
     based on *who owns the repo*, not which folder you happen to be in or
     how the remote was added. This means `git clone`, `git init` +
     `git remote add`, and GUI clients all just work, with no shell wrapper
-    needed, for GitHub, GitLab, or a self-hosted server alike.
+    needed for git, for GitHub, GitLab, or a self-hosted server alike.
   - `includeIf` rules so the right `[user]` identity applies based on each
     account's designated folder, or (once a remote exists) its host alias
     or owner — whichever is known.
@@ -76,7 +79,8 @@ whichever account claims them, regardless of which folder the repo is in.
 ## GitHub CLI (`gh`)
 
 For accounts on `github.com` (or `*.ghe.com`), the setup can also take care of
-the GitHub CLI (on by default, one checkbox / question):
+the GitHub CLI (on by default, one checkbox / question). GitLab and other
+hosts only get the git setup above, since `gh` doesn't work with them.
 
 - **Installs `gh`** if it isn't there: winget, scoop or choco on Windows,
   Homebrew on macOS, Homebrew or apt/dnf/pacman/zypper on Linux. If none
@@ -99,7 +103,8 @@ the GitHub CLI (on by default, one checkbox / question):
   don't interfere with each other. `gh auth ...` commands are left alone, and
   a `GH_TOKEN` you set yourself always wins. Run `gh-whoami` to see which
   account `gh` would use here, and why. Open a new terminal after the setup so
-  the profile change is loaded.
+  the profile change is loaded. If PowerShell's execution policy blocks
+  profiles, the setup tells you the command that allows them.
 - Sets `gh`'s active account to your default account, which is what `gh` uses
   where the wrapper isn't loaded (e.g. `cmd.exe`).
 
@@ -109,7 +114,8 @@ through the SSH aliases above, including clones that `gh` starts.
 ## Remembering your last answers
 
 On a successful apply, your answers — labels, hosts, names, emails, owners,
-folders, key **paths** (never key contents) — are cached to
+folders, key **paths** (never key contents), and whether to set up `gh` — are
+cached to
 `~/.git-account-setup-cache.json`. Next time you open the wizard, every
 account and field is prefilled from that cache, so you can see your last
 configuration and just tweak or re-confirm it instead of retyping everything
@@ -140,5 +146,5 @@ brand-new personal repo created with a plain `git init` + `git remote add`
 rewritten to the *work* SSH identity and the guard hooks block both the
 commit and the push with a confusing "wrong identity" error. Scoping the
 `insteadOf` rule per (host, owner) instead of blanket-to-one-account closes
-that gap at the source, makes the shell wrapper unnecessary altogether, and
+that gap at the source, makes a shell wrapper unnecessary for git, and
 generalizes cleanly to any number of accounts across any number of hosts.
