@@ -32,7 +32,8 @@ Add as many accounts as you want. For each one you give:
 - a short **label** (used for the SSH alias and git aliases, e.g.
   `personal`, `work`, `client1`)
 - a **git host** — `github.com`, `gitlab.com`, or any self-hosted domain
-- one or more **owners/orgs** on that host that belong to this account
+- **your username** on that host (the account you log in with), plus any
+  other orgs/owners that belong to this account
 - git author name + email
 - an **optional dedicated folder** — repos under it always use this
   account, even before a remote exists
@@ -53,7 +54,8 @@ whichever account claims them, regardless of which folder the repo is in.
   are left alone):
   - a default `[user]` identity, if you designated one account as default
   - **owner-scoped** `url.insteadOf` rules per (host, owner): any
-    `https://<host>/<owner>/...` remote is rewritten to the right SSH alias
+    `https://<host>/<owner>/...` remote (or the SSH form
+    `git@<host>:<owner>/...`) is rewritten to the right SSH alias
     based on *who owns the repo*, not which folder you happen to be in or
     how the remote was added. This means `git clone`, `git init` +
     `git remote add`, and GUI clients all just work, with no shell wrapper
@@ -71,6 +73,39 @@ whichever account claims them, regardless of which folder the repo is in.
 - git aliases per account: `git whoami`, `git use-<label>`,
   `git clone-<label>`.
 
+## GitHub CLI (`gh`)
+
+For accounts on `github.com` (or `*.ghe.com`), the setup can also take care of
+the GitHub CLI (on by default, one checkbox / question):
+
+- **Installs `gh`** if it isn't there: winget, scoop or choco on Windows,
+  Homebrew on macOS, Homebrew or apt/dnf/pacman/zypper on Linux. If none
+  works it tells you to get it from https://cli.github.com.
+- **Logs `gh` in to every GitHub account** that isn't logged in yet. Each
+  login opens `github.com/login/device` in your browser (the GUI shows the
+  code and copies it for you). `gh` logs in whichever account the browser is
+  signed in to, so sign the browser in to the account being asked for, or use
+  a private window. If the wrong account got logged in, the setup says so.
+- **Makes plain `gh` use the right account.** A small `gh` wrapper is added to
+  your PowerShell profile, `~/.bashrc` (Git Bash on Windows) and `~/.zshrc`
+  (macOS). Every `gh` command picks the account, in this order:
+  1. an owner named in the command, e.g. `gh repo create your-user/new` or
+     `--repo your-company-org/app`
+  2. the repo you're in (its `origin`, then the email it commits with)
+  3. the dedicated folder you're in, even if it isn't a repo yet
+  4. the default account
+
+  It passes that account's token to that one `gh` command only, so terminals
+  don't interfere with each other. `gh auth ...` commands are left alone, and
+  a `GH_TOKEN` you set yourself always wins. Run `gh-whoami` to see which
+  account `gh` would use here, and why. Open a new terminal after the setup so
+  the profile change is loaded.
+- Sets `gh`'s active account to your default account, which is what `gh` uses
+  where the wrapper isn't loaded (e.g. `cmd.exe`).
+
+Git operations never depend on `gh`'s login: clone, pull and push always go
+through the SSH aliases above, including clones that `gh` starts.
+
 ## Remembering your last answers
 
 On a successful apply, your answers — labels, hosts, names, emails, owners,
@@ -82,8 +117,10 @@ configuration and just tweak or re-confirm it instead of retyping everything
 
 ## Safety
 
-- Every file the script would modify is backed up first, to
-  `~/.git-identity-backup-<timestamp>/`.
+- Every file the script would modify (including shell profiles) is backed up
+  first, to `~/.git-identity-backup-<timestamp>/`. Profile edits live in a
+  marked block and keep the file's encoding and line endings; unticking the
+  `gh` option removes the block again.
 - Re-running the script is idempotent — it replaces its own previously
   written block/lines instead of duplicating them, and leaves any
   unrelated content in `~/.gitconfig` / `~/.ssh/config` untouched.
