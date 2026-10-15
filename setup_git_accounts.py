@@ -45,6 +45,14 @@ Usage:
     python setup_git_accounts.py            # GUI wizard (tkinter)
     python setup_git_accounts.py --cli      # terminal wizard, no tkinter needed
     python setup_git_accounts.py --cli --dry-run   # show what would happen, write nothing
+    python setup_git_accounts.py --config accounts.json   # no questions (see below)
+    python setup_git_accounts.py --from-cache             # reuse the last wizard answers
+
+New laptop in one command: copy ~/.git-account-setup-cache.json (or your own
+accounts.json in the same format) over, run with --config, then upload the
+public keys it prints. Repos in an account's dedicated folder also use that
+account's SSH key by path (core.sshCommand), and owner names are matched in
+both original and lowercase spelling.
 
 Works on Windows, macOS and Linux (Python 3.8+, stdlib only; tkinter is
 optional and only needed for the GUI wizard).
@@ -121,6 +129,24 @@ def is_github_host(host: str) -> bool:
 def gh_env() -> dict:
     # A token in the environment would override every stored gh login.
     return {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_VARS}
+
+
+def owner_variants(owner: str) -> list[str]:
+    """URL owners as typed vs. lowercased. GitHub/GitLab URLs are case-insensitive
+    but git's insteadOf / includeIf matching is not, so cover both spellings."""
+    out = [owner]
+    if owner.lower() != owner:
+        out.append(owner.lower())
+    return out
+
+
+def tilde_path(p) -> str:
+    """Store paths under $HOME as ~/... so a saved config works on another machine/user."""
+    p = Path(p)
+    try:
+        return "~/" + p.relative_to(Path.home()).as_posix()
+    except ValueError:
+        return str(p)
 
 
 @dataclass
@@ -240,9 +266,9 @@ def account_to_cache(acct: Account) -> dict:
         "email": acct.email,
         "host": acct.host,
         "owners": acct.owners,
-        "key_path": str(acct.key_path),
+        "key_path": tilde_path(acct.key_path),
         "generate_key": acct.generate_key,
-        "folder": str(acct.folder) if acct.folder else "",
+        "folder": tilde_path(acct.folder) if acct.folder else "",
         "is_default": acct.is_default,
     }
 
@@ -250,7 +276,7 @@ def account_to_cache(acct: Account) -> dict:
 def save_cache(cfg: SetupConfig) -> None:
     data = {
         "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        "hooks_dir": str(cfg.hooks_dir),
+        "hooks_dir": tilde_path(cfg.hooks_dir),
         "setup_gh": cfg.setup_gh,
         "accounts": [account_to_cache(a) for a in cfg.accounts],
     }
@@ -338,6 +364,13 @@ def write_identity_file(acct: Account, dry_run: bool, log) -> None:
         f'[credential "https://{acct.host}"]\n'
         f"\tusername = {acct.owners[0]}\n"
     )
+    if acct.folder:
+        # Path-based SSH key: any repo inside the account's folder (even one cloned
+        # from an owner/org git does not know about) authenticates with this key.
+        content += (
+            f"\n[core]\n"
+            f'\tsshCommand = ssh -i "{to_posix(acct.key_path.expanduser())}" -o IdentitiesOnly=yes\n'
+        )
     log(f"  writing {acct.identity_file}")
     if not dry_run:
         acct.identity_file.write_text(content, newline="\n")
@@ -370,9 +403,10 @@ def build_managed_block(cfg: SetupConfig) -> str:
     for a in cfg.accounts:
         for owner in a.owners:
             lines.append(f'[url "git@{a.label}:{owner}/"]')
-            lines.append(f"\tinsteadOf = https://{a.host}/{owner}/")
-            lines.append(f"\tinsteadOf = git@{a.host}:{owner}/")
-            lines.append(f"\tinsteadOf = ssh://git@{a.host}/{owner}/")
+            for o in owner_variants(owner):
+                lines.append(f"\tinsteadOf = https://{a.host}/{o}/")
+                lines.append(f"\tinsteadOf = git@{a.host}:{o}/")
+                lines.append(f"\tinsteadOf = ssh://git@{a.host}/{o}/")
 
     # Folder rules: a designated folder always uses that account's identity,
     # even before a remote exists (e.g. `git init` + first commit).
@@ -397,9 +431,11 @@ def build_managed_block(cfg: SetupConfig) -> str:
             lines.append(f"\tpath = {to_posix(a.identity_file)}")
         for owner in a.owners:
             for pattern in (
-                f"https://{a.host}/{owner}/**",
-                f"git@{a.host}:{owner}/**",
-                f"ssh://git@{a.host}/{owner}/**",
+                p for o in owner_variants(owner) for p in (
+                    f"https://{a.host}/{o}/**",
+                    f"git@{a.host}:{o}/**",
+                    f"ssh://git@{a.host}/{o}/**",
+                )
             ):
                 lines.append(f'[includeIf "hasconfig:remote.*.url:{pattern}"]')
                 lines.append(f"\tpath = {to_posix(a.identity_file)}")
@@ -1156,6 +1192,38 @@ def setup_gh(cfg: SetupConfig, dry_run: bool, log, gh_login, pump, interactive: 
 # orchestration
 # --------------------------------------------------------------------------
 
+def verify_accounts(cfg: SetupConfig, log) -> None:
+    """ssh -T each alias: show the public key to upload if auth fails, and warn when
+    the host reports a login that differs from the configured owner."""
+    for a in cfg.accounts:
+        try:
+            r = subprocess.run(
+                ["ssh", "-T", "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+                 "-o", "ConnectTimeout=10", f"git@{a.label}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            out = (r.stdout + r.stderr).strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"  {a.label}: could not run ssh ({e})")
+            continue
+        m = re.search(r"Hi ([^!]+)!|Welcome to GitLab, @(\S+?)!", out)
+        if m:
+            login = m.group(1) or m.group(2)
+            if login.lower() == a.owners[0].lower():
+                log(f"  {a.label}: OK (authenticated as {login})")
+            else:
+                log(f"  {a.label}: WARNING authenticated as '{login}' but owner is '{a.owners[0]}' "
+                    f"-- re-run with the correct username or this key is on the wrong account")
+            continue
+        log(f"  {a.label}: NOT authenticated yet. Add this public key to the {a.host} account "
+            f"'{a.owners[0]}' (Settings > SSH and GPG keys), then re-run to verify:")
+        pub = Path(str(a.key_path) + ".pub")
+        if pub.exists():
+            log(f"    {pub.read_text().strip()}")
+        if is_github_host(a.host):
+            log(f"    https://{a.host}/settings/ssh/new")
+
+
 def apply_config(cfg: SetupConfig, dry_run: bool, log, gh_login=None, pump=lambda: None,
                  interactive: bool = True) -> None:
     errors = validate_accounts(cfg.accounts)
@@ -1167,8 +1235,10 @@ def apply_config(cfg: SetupConfig, dry_run: bool, log, gh_login=None, pump=lambd
     # git matches gitdir rules against the repo's real path, so expand ~, 8.3
     # short names (C:\Users\ABCDEF~1) and symlinks, or the folder rule never fires.
     for a in cfg.accounts:
+        a.key_path = a.key_path.expanduser()
         if a.folder:
             a.folder = a.folder.expanduser().resolve()
+    cfg.hooks_dir = cfg.hooks_dir.expanduser()
 
     log("== backing up existing files ==")
     to_backup = [cfg.home / ".gitconfig", cfg.home / ".ssh" / "config"]
@@ -1205,6 +1275,10 @@ def apply_config(cfg: SetupConfig, dry_run: bool, log, gh_login=None, pump=lambd
     if not dry_run:
         save_cache(cfg)
         log(f"  remembered these settings in {CACHE_FILE} for next time")
+
+    if not dry_run:
+        log("== verifying SSH access ==")
+        verify_accounts(cfg, log)
 
     log("")
     log("Done." if not dry_run else "Dry run complete -- nothing was written.")
@@ -1602,11 +1676,47 @@ def gui_wizard() -> None:
 # entry point
 # --------------------------------------------------------------------------
 
+def config_from_file(path: Path) -> SetupConfig:
+    """Build a SetupConfig from a JSON file in the same format as the cache file
+    (~/.git-account-setup-cache.json). Paths may use ~."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    accounts = []
+    for c in data["accounts"]:
+        label = c["label"]
+        accounts.append(Account(
+            label=label,
+            name=c.get("name") or c["owners"][0],
+            email=c["email"],
+            host=c.get("host", "github.com"),
+            owners=list(c["owners"]),
+            key_path=Path(c.get("key_path") or f"~/.ssh/id_ed25519_{label}"),
+            generate_key=c.get("generate_key", True),
+            folder=Path(c["folder"]) if c.get("folder") else None,
+            is_default=c.get("is_default", False),
+        ))
+    return SetupConfig(
+        accounts=accounts,
+        hooks_dir=Path(data.get("hooks_dir", "~/.githooks")).expanduser(),
+        setup_gh=data.get("setup_gh", False),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--cli", action="store_true", help="use the terminal wizard instead of the GUI")
     parser.add_argument("--dry-run", action="store_true", help="(CLI mode) preview changes, write nothing")
+    parser.add_argument("--config", metavar="FILE",
+                        help="apply a JSON config (same format as ~/.git-account-setup-cache.json) "
+                             "without asking questions -- copy it to another laptop for a one-command setup")
+    parser.add_argument("--from-cache", action="store_true",
+                        help="like --config, using ~/.git-account-setup-cache.json")
     args = parser.parse_args()
+
+    if args.config or args.from_cache:
+        cfg_path = Path(args.config).expanduser() if args.config else CACHE_FILE
+        cfg = config_from_file(cfg_path)
+        apply_config(cfg, args.dry_run, print, interactive=False)
+        return
 
     if args.cli:
         cfg = cli_wizard()
