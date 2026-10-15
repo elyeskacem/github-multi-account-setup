@@ -1,0 +1,17 @@
+{
+  "setup_gh": false,
+  "accounts": [
+    {
+      "label": "work", "name": "Your Name", "email": "you@company.com",
+      "host": "github.com", "owners": ["work-github-username", "optional-work-org"],
+      "key_path": "~/.ssh/id_ed25519_work", "generate_key": true,
+      "folder": "", "is_default": true
+    },
+    {
+      "label": "personal", "name": "Your Name", "email": "you@example.com",
+      "host": "github.com", "owners": ["personal-github-username"],
+      "key_path": "~/.ssh/id_ed25519_personal", "generate_key": true,
+      "folder": "~/Personal", "is_default": false
+    }
+  ]
+}

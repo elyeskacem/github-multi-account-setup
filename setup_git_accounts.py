@@ -1192,36 +1192,73 @@ def setup_gh(cfg: SetupConfig, dry_run: bool, log, gh_login, pump, interactive: 
 # orchestration
 # --------------------------------------------------------------------------
 
+def key_upload_url(host: str) -> str:
+    """Page where the account's public key has to be pasted."""
+    h = host.lower()
+    if is_github_host(h):
+        return f"https://{host}/settings/ssh/new"
+    if "gitlab" in h:
+        return f"https://{host}/-/user_settings/ssh_keys"
+    return f"https://{host}"
+
+
+def key_title(acct: Account) -> str:
+    import socket
+    return f"{socket.gethostname()} ({acct.label})"
+
+
+def read_public_key(acct: Account) -> str:
+    pub = Path(str(acct.key_path.expanduser()) + ".pub")
+    try:
+        return pub.read_text().strip()
+    except OSError:
+        return ""
+
+
+def check_account(acct: Account) -> tuple[str, str]:
+    """ssh -T the account's alias. Returns (status, login):
+    status is 'ok', 'wrong-user', 'no-auth' or 'error'."""
+    try:
+        r = subprocess.run(
+            ["ssh", "-T", "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+             "-o", "ConnectTimeout=10", f"git@{acct.label}"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "error", ""
+    m = re.search(r"Hi ([^!]+)!|Welcome to GitLab, @(\S+?)!", r.stdout + r.stderr)
+    if not m:
+        return "no-auth", ""
+    login = m.group(1) or m.group(2)
+    return ("ok" if login.lower() == acct.owners[0].lower() else "wrong-user"), login
+
+
+def key_steps(acct: Account) -> str:
+    return (
+        f"1. Sign in to {acct.host} as '{acct.owners[0]}' (the {acct.label} account).\n"
+        f"2. Open {key_upload_url(acct.host)}\n"
+        f"3. Title: {key_title(acct)}   Key type: Authentication Key\n"
+        f"4. Paste the public key below and save."
+    )
+
+
 def verify_accounts(cfg: SetupConfig, log) -> None:
-    """ssh -T each alias: show the public key to upload if auth fails, and warn when
-    the host reports a login that differs from the configured owner."""
+    """Check every account's SSH access; for any that fails, say exactly which
+    host account the public key must be added to, and show the key."""
     for a in cfg.accounts:
-        try:
-            r = subprocess.run(
-                ["ssh", "-T", "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
-                 "-o", "ConnectTimeout=10", f"git@{a.label}"],
-                capture_output=True, text=True, timeout=30,
-            )
-            out = (r.stdout + r.stderr).strip()
-        except (OSError, subprocess.SubprocessError) as e:
-            log(f"  {a.label}: could not run ssh ({e})")
-            continue
-        m = re.search(r"Hi ([^!]+)!|Welcome to GitLab, @(\S+?)!", out)
-        if m:
-            login = m.group(1) or m.group(2)
-            if login.lower() == a.owners[0].lower():
-                log(f"  {a.label}: OK (authenticated as {login})")
-            else:
-                log(f"  {a.label}: WARNING authenticated as '{login}' but owner is '{a.owners[0]}' "
-                    f"-- re-run with the correct username or this key is on the wrong account")
-            continue
-        log(f"  {a.label}: NOT authenticated yet. Add this public key to the {a.host} account "
-            f"'{a.owners[0]}' (Settings > SSH and GPG keys), then re-run to verify:")
-        pub = Path(str(a.key_path) + ".pub")
-        if pub.exists():
-            log(f"    {pub.read_text().strip()}")
-        if is_github_host(a.host):
-            log(f"    https://{a.host}/settings/ssh/new")
+        status, login = check_account(a)
+        if status == "ok":
+            log(f"  {a.label}: OK (authenticated as {login})")
+        elif status == "wrong-user":
+            log(f"  {a.label}: WARNING authenticated as '{login}' but owner is '{a.owners[0]}' "
+                f"-- this key is on the wrong {a.host} account, or the username is mistyped")
+        elif status == "error":
+            log(f"  {a.label}: could not run ssh")
+        else:
+            log(f"  {a.label}: NOT authenticated yet -- add this key to the {a.host} account '{a.owners[0]}':")
+            for line in key_steps(a).splitlines():
+                log(f"    {line}")
+            log(f"    {read_public_key(a)}")
 
 
 def apply_config(cfg: SetupConfig, dry_run: bool, log, gh_login=None, pump=lambda: None,
@@ -1645,6 +1682,60 @@ def gui_wizard() -> None:
         drain()
         win.destroy()
 
+    def show_keys_window(cfg: SetupConfig):
+        win = tk.Toplevel(root)
+        win.title("Add your SSH keys to your git accounts")
+        win.geometry("760x640")
+        outer = ttk.Frame(win, padding=10)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(
+            outer, wraplength=720, justify="left",
+            text="Each account needs its public key added once on the git host, while signed in as "
+                 "that account. Copy the key, open the page, paste it, save, then press Re-check.",
+        ).pack(anchor="w", pady=(0, 8))
+
+        for a in cfg.accounts:
+            box = ttk.LabelFrame(outer, text=f"{a.label} -> {a.host} / {a.owners[0]}", padding=8)
+            box.pack(fill="x", pady=6)
+            ttk.Label(box, text=f"Sign in to {a.host} as '{a.owners[0]}', open the key page, "
+                                f"and paste this key (title: {key_title(a)}):",
+                      wraplength=700, justify="left").pack(anchor="w")
+            txt = tk.Text(box, height=4, wrap="char")
+            txt.insert("1.0", read_public_key(a))
+            txt.configure(state="disabled")
+            txt.pack(fill="x", pady=4)
+            status_var = tk.StringVar(value="not checked yet")
+
+            def copy(a=a, status_var=status_var):
+                root.clipboard_clear()
+                root.clipboard_append(read_public_key(a))
+                root.update()
+                status_var.set("copied to clipboard")
+
+            def open_page(a=a):
+                import webbrowser
+                webbrowser.open(key_upload_url(a.host))
+
+            def recheck(a=a, status_var=status_var):
+                status_var.set("checking...")
+                root.update()
+                st, login = check_account(a)
+                status_var.set({
+                    "ok": f"OK - authenticated as {login}",
+                    "wrong-user": f"key is on '{login}', expected '{a.owners[0]}'",
+                    "no-auth": "not added yet (or not saved)",
+                    "error": "could not run ssh",
+                }[st])
+
+            row_f = ttk.Frame(box)
+            row_f.pack(fill="x")
+            ttk.Button(row_f, text="Copy key", command=copy).pack(side="left")
+            ttk.Button(row_f, text="Open key page", command=open_page).pack(side="left", padx=6)
+            ttk.Button(row_f, text="Re-check", command=recheck).pack(side="left")
+            ttk.Label(row_f, textvariable=status_var).pack(side="left", padx=10)
+
+        ttk.Button(outer, text="Close", command=win.destroy).pack(anchor="e", pady=8)
+
     def on_apply():
         cfg = collect_config()
         errors = validate_accounts(cfg.accounts)
@@ -1657,7 +1748,8 @@ def gui_wizard() -> None:
         try:
             apply_config(cfg, dry_run, log, gh_login=gui_gh_login, pump=root.update, interactive=False)
             if not dry_run:
-                messagebox.showinfo("Done", "Setup complete. See the log for details.")
+                messagebox.showinfo("Done", "Setup complete. Next: add each account's SSH key to its git host.")
+                show_keys_window(cfg)
         except Exception as e:  # surfaced to the user, not silently swallowed
             log(f"ERROR: {e}")
             messagebox.showerror("Setup failed", str(e))

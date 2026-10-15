@@ -148,3 +148,15 @@ commit and the push with a confusing "wrong identity" error. Scoping the
 `insteadOf` rule per (host, owner) instead of blanket-to-one-account closes
 that gap at the source, makes a shell wrapper unnecessary for git, and
 generalizes cleanly to any number of accounts across any number of hosts.
+
+## SSH keys and quick setup on another machine
+
+The tool generates one ed25519 key per account. After applying, the GUI opens an
+"Add your SSH keys" window: for each account it shows the public key with a
+**Copy key** button, says which host account to sign in to, opens the right
+key-upload page, and has a **Re-check** button that tests the connection. The
+terminal wizard prints the same steps and keys.
+
+For a no-questions setup, copy `accounts.example.json` to `accounts.json`, edit
+it, and run `python setup_git_accounts.py --config accounts.json`
+(`~` works in paths). `--from-cache` reuses your last wizard answers.
