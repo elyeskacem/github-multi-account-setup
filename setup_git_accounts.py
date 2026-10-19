@@ -28,7 +28,10 @@ owns the current repo or folder. `gh-whoami` tells you which one and why.
 One pair of hooks (pre-commit, pre-push), wired up via core.hooksPath,
 refuses to commit or push under the wrong identity for a given remote --
 matching is by host+owner, not tied to GitHub specifically, so GitLab and
-self-hosted remotes are guarded exactly the same way. Every other hook name
+self-hosted remotes are guarded exactly the same way. A repo owned by
+someone no account claims (one you collaborate on) gets a per-repo push URL
+through the SSH alias of the account it commits as, set at clone, commit or
+first push, so it is never stuck as an "unrecognized remote". Every other hook name
 gets a small pass-through stub so repo-local hooks (husky, lint-staged,
 ...) still run.
 
@@ -507,11 +510,20 @@ def whoami_alias(cfg: SetupConfig) -> str:
     )
 
 
-def use_alias(acct: Account) -> str:
+def use_alias(acct: Account, cfg: SetupConfig) -> str:
+    # A push URL routed through another account on the same host (see
+    # adopt_remote in the hooks) follows the switch, so the guard does not
+    # then block every push as the wrong identity.
+    same_host = "|".join(
+        f"git@{a.label}:*" for a in cfg.accounts if a.host.lower() == acct.host.lower()
+    )
     return (
         f'!f() {{ git config user.name "{acct.name}" '
         f'&& git config user.email "{acct.email}" '
-        f'&& echo "this repo -> {acct.label.upper()} ({acct.host}/{acct.owners[0]})"; }}; f'
+        f'&& p=$(git config --get remote.origin.pushurl); '
+        f'case "$p" in {same_host}) git config remote.origin.pushurl "git@{acct.label}:${{p#*:}}" '
+        f'&& echo "pushes  -> git@{acct.label}:${{p#*:}}" ;; esac; '
+        f'echo "this repo -> {acct.label.upper()} ({acct.host}/{acct.owners[0]})"; }}; f'
     )
 
 
@@ -553,13 +565,50 @@ def update_global_gitconfig(cfg: SetupConfig, dry_run: bool, log) -> None:
 
     git_config(["alias.whoami", whoami_alias(cfg)])
     for a in cfg.accounts:
-        git_config([f"alias.use-{a.label}", use_alias(a)])
+        git_config([f"alias.use-{a.label}", use_alias(a, cfg)])
         git_config([f"alias.clone-{a.label}", clone_alias(a.label)])
 
 
 # --------------------------------------------------------------------------
 # hooks
 # --------------------------------------------------------------------------
+
+def build_adopt_remote(cfg: SetupConfig) -> str:
+    """sh function shared by the hooks: give an unclaimed remote a push URL."""
+    aliases = "|".join(f"git@{a.label}:*|ssh://git@{a.label}/*|{a.label}:*" for a in cfg.accounts)
+    cases = "\n".join(
+        f'        "{a.host.lower()} {a.email.lower()}") alias="{a.label}" ;;'
+        for a in cfg.accounts
+    )
+    return f"""\
+# A remote whose owner no account claims -- a repo you were added to as a
+# collaborator, the upstream of a fork -- gets no insteadOf rewrite, so it
+# keeps its plain https/ssh URL and the push guard can't tell which account
+# a push would go out as. Route its pushes through the SSH alias of the
+# account this repo commits as: a per-repo pushurl, fetches left alone. A
+# pushurl you set yourself is never touched. Prints the new push URL, or
+# fails silently when there is nothing to do.
+adopt_remote () {{
+    git config --get "remote.$1.url" >/dev/null || return 1
+    git config --get "remote.$1.pushurl" >/dev/null && return 1
+    url=$(git remote get-url --push "$1" 2>/dev/null) || return 1
+    case "$url" in
+        {aliases}) return 1 ;;
+        https://*|git@*:*|ssh://git@*/*) ;;
+        *) return 1 ;;
+    esac
+    host=$(printf '%s' "$url" | sed -E 's#^(https://([^/@]*@)?|git@|ssh://git@)([^/:]+).*#\\3#' | tr 'A-Z' 'a-z')
+    email=$(git config user.email 2>/dev/null | tr 'A-Z' 'a-z')
+    case "$host $email" in
+{cases}
+        *) return 1 ;;
+    esac
+    path=$(printf '%s' "$url" | {STRIP_HOST_SED})
+    git config "remote.$1.pushurl" "git@$alias:$path" || return 1
+    printf 'git@%s:%s\\n' "$alias" "$path"
+}}
+"""
+
 
 def build_pre_commit(cfg: SetupConfig) -> str:
     cases = "\n".join(
@@ -573,11 +622,18 @@ def build_pre_commit(cfg: SetupConfig) -> str:
 # Identity guard, commit-time. Blocks a commit whose author address does not
 # match the account this repo's origin belongs to (matched by host alias, so
 # this works the same for GitHub, GitLab, or any self-hosted remote).
+{build_adopt_remote(cfg)}
 url=$(git remote get-url origin 2>/dev/null)
 case "$url" in
 {cases}
     *)  expected='' ;;
 esac
+
+# An origin no account claims: set up where its pushes go now, at commit
+# time, so the first push already goes out as the right account.
+if [ -z "$expected" ] && adopted=$(adopt_remote origin); then
+    echo "  note: pushes to origin now go through $adopted (the account this repo commits as)" >&2
+fi
 
 if [ -n "$expected" ]; then
     configured=$(git config user.email 2>/dev/null)
@@ -615,7 +671,11 @@ def build_pre_push(cfg: SetupConfig) -> str:
             f'expected="{acct.email}"; forbidden_emails="{forbidden_emails}" ;;'
         )
     cases_str = "\n".join(cases)
-    alias_hints = "\n".join(f"    git remote set-url $remote_name git@{a.label}:<owner>/<repo>.git" for a in cfg.accounts)
+    width = max(len(a.label) for a in cfg.accounts)
+    alias_hints = "\n".join(
+        f"    git use-{a.label:<{width}}  &&  git config remote.$remote_name.pushurl git@{a.label}:$path"
+        for a in cfg.accounts
+    )
     fix_hints = "   or   ".join(f"git use-{a.label}" for a in cfg.accounts)
     return f"""\
 #!/bin/sh
@@ -625,7 +685,7 @@ def build_pre_push(cfg: SetupConfig) -> str:
 remote_name="$1"
 remote_url="$2"
 input=$(cat)
-
+{build_adopt_remote(cfg)}
 chain_local () {{
     gitdir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0
     local_hook="$gitdir/hooks/pre-push"
@@ -639,14 +699,36 @@ chain_local () {{
 case "$remote_url" in
 {cases_str}
     https://*|git@*:*|ssh://git@*/*)
+        # Normally set up already at clone or commit time; this catches a
+        # remote added since. The push under way still goes to the plain
+        # URL, with whatever credentials that would use, so it is stopped
+        # either way -- the next one goes through the alias.
+        if adopted=$(adopt_remote "$remote_name"); then
+            cat >&2 <<MSG
+
+  PUSH NOT SENT -- remote set up for your account, push again
+
+    remote  : $remote_url
+    push URL: $adopted
+
+  No account claims this repo's owner, so its pushes now go through the
+  SSH alias of the account this repo commits as ($(git config user.email)).
+  Nothing was sent. Run the same push again.
+
+MSG
+            exit 1
+        fi
+        path=$(printf '%s' "$remote_url" | {STRIP_HOST_SED})
         cat >&2 <<MSG
 
   PUSH BLOCKED -- unrecognized remote
 
     remote: $remote_url
+    author: $(git config user.email 2>/dev/null || echo '<none>')
 
-  This URL doesn't match any configured account's host alias, so the guard
-  can't check it. Point it at a host alias instead, e.g.:
+  No account claims this repo's owner, and this repo's author address is
+  not one of your accounts on that host, so the guard can't tell which
+  account to push as. Pick the account, then push again:
 
 {alias_hints}
 
@@ -741,11 +823,20 @@ retarget () {{
     esac
 }}
 
+{build_adopt_remote(cfg)}
 top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 lower=$(printf '%s' "$top" | tr 'A-Z' 'a-z')
 case "$lower" in
 {cases_str}
 esac
+
+# Outside every dedicated folder, a clone whose owner no account claims
+# (a repo you collaborate on) still gets pushes routed through the account
+# it commits as -- see adopt_remote. A no-op once set, or for a retargeted
+# or owner-matched origin.
+if adopted=$(adopt_remote origin); then
+    echo "  note: pushes to origin go through $adopted (the account this repo commits as)" >&2
+fi
 
 gitdir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0
 local_hook="$gitdir/hooks/post-checkout"

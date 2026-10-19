@@ -73,8 +73,34 @@ whichever account claims them, regardless of which folder the repo is in.
   additionally scans the commits actually being sent for an author from any
   *other* configured account. Every other hook name gets a small
   pass-through stub so repo-local hooks (husky, lint-staged, ...) still run.
+  The hooks also give repos owned by *someone else* a push URL — see
+  [Repos you don't own](#repos-you-dont-own).
 - git aliases per account: `git whoami`, `git use-<label>`,
   `git clone-<label>`.
+
+## Repos you don't own
+
+The `insteadOf` rewriting only knows the owners you listed. A repo owned by
+someone else — one you were added to as a collaborator, or the upstream of a
+fork — keeps its plain `https://` (or `git@github.com:`) remote, and the
+push guard can't tell which account a push over it would go out as.
+
+So the hooks route that repo's **pushes** through the SSH alias of the
+account it *commits as* (its dedicated folder's account, else the default):
+they set a per-repo `remote.origin.pushurl` such as
+`git@work:someone/their-repo.git`. Fetches keep using the original URL, and
+nothing changes on the server.
+
+- `post-checkout` does it when you clone, and `pre-commit` on your first
+  commit, so the first push normally just works.
+- If a remote was added later and you push before committing, `pre-push`
+  sets the push URL, stops that one push (it would have gone out over
+  `https` with whatever credentials that uses), and asks you to push again.
+- `git use-<label>` moves such a push URL to the new account along with the
+  author identity.
+- A `pushurl` you set yourself is never changed. If the repo's author
+  address isn't one of your accounts on that host, the push is blocked with
+  the exact commands to pick an account.
 
 ## GitHub CLI (`gh`)
 
